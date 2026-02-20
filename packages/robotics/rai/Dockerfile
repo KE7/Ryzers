@@ -36,6 +36,9 @@ RUN echo "source $VIRTUAL_ENV/bin/activate" >> /root/.bashrc
 RUN pip install --upgrade pip "setuptools<82" poetry empy lark && \
     pip install --no-build-isolation openai-whisper==20231117
 
+# Remove opencv-python to avoid conflict with opencv-python-headless from RAI
+RUN pip uninstall -y opencv-python opencv-python-headless || true
+
 # Clone and install RAI framework
 WORKDIR /ryzers
 RUN git clone https://github.com/RobotecAI/rai.git
