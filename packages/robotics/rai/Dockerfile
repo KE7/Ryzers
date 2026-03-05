@@ -32,9 +32,10 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN echo "source $VIRTUAL_ENV/bin/activate" >> /root/.bashrc
 
-# Install Poetry into the venv
-RUN pip install --upgrade pip "setuptools<82" poetry empy lark && \
-    pip install --no-build-isolation openai-whisper==20231117
+# Install uv, then use it for all subsequent Python package installs
+RUN pip install --upgrade pip uv && \
+    uv pip install "setuptools<82" empy lark && \
+    uv pip install --no-build-isolation openai-whisper==20231117
 
 # Clone and install RAI framework
 WORKDIR /ryzers
@@ -44,8 +45,14 @@ WORKDIR /ryzers/rai
 RUN vcs import < ros_deps.repos
 RUN vcs import < demos.repos
 
-RUN poetry config virtualenvs.create false && \
-    poetry install --all-groups
+# Install ROCm-native torch first so uv sync reuses it rather than pulling CUDA wheel from PyPI
+RUN uv pip install torch==2.6.0 torchvision torchaudio \
+    --index-url https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/
+
+RUN uv sync --all-groups \
+    --no-install-package torch \
+    --no-install-package torchvision \
+    --no-install-package torchaudio
 
 RUN rosdep init && \
     rosdep update && \
