@@ -54,7 +54,8 @@ ryzers run "python /ryzers/test_sam3d.py --check-repeatability"
 The repeatability check compares one cold reconstruction with three warm runs,
 requiring exact sparse coordinates and pose, SLAT normalized RMS error at most
 1%, and sampled mesh p99 distance at most 0.5% of the reference bounding-box
-diagonal. It requires the model weights and runs one mask.
+diagonal. It requires the model weights and runs one mask. This is a numerical
+regression diagnostic, not a score against Meta’s artist references.
 
 ## ROCm support and validation
 
@@ -87,16 +88,19 @@ ROCm 7.14 / PyTorch 2.12. Under the same native-allocator/FAST runtime,
 from the first working port to corrected defaults, using default steps and both
 geometry decoders. Peak allocated memory fell **18.88 → 13.75 GiB**.
 The stability settings cost 0.82 s (1.6%) versus the former merged defaults.
-Both captured benchmark pairs and all 100 dataset pairs meet the four numerical
-limits under that common runtime; historical DEFAULT-mode outputs differ.
+Both devices reconstructed the 100 public SA-3DAO reference objects and exported
+all 27 example objects with complete scene assembly. Average artist-reference
+F-score and IoU remain within the predeclared quality-preservation margin.
+These are local shape-quality measurements, not official Meta benchmark scores.
+A separate 12-input cold-start sweep completed 24/24 fresh processes on each
+GPU, with finite mesh, pose and Gaussian attributes.
 
-Both devices exported all 27 objects and assembled the complete scene. The
-8060S peak allocated memory including assembly is **14.80 GiB**, excluding
-checkpoint loading. The R9700 100-case cohort passes, but a separate fresh-process
-benchmark pair fails exact coordinates and pose; the unchanged port also varies
-between fresh default-mode processes. This remains unresolved. See
-[VALIDATION.md](VALIDATION.md) for all reference comparisons, maximum errors,
-historical results and measurement scopes.
+The 8060S peak allocated memory including assembly is **14.80 GiB**, excluding
+checkpoint loading. Outputs can vary between fresh processes, including in the
+unchanged compatibility port. Numerical comparisons, maximum errors and all
+historical results are retained in [VALIDATION.md](VALIDATION.md); an output
+agreement failure does not by itself mean reconstruction failed or shape quality
+degraded.
 
 Optional mesh cleanup, texture baking, layout optimization and Gaussian video
 rendering need additional GPU rasterizers and are not supported here. The
@@ -113,7 +117,10 @@ metrics; it is separate from the default smoke test. See
 layout, commands, scoring conventions and coverage. The 400 historical and
 300 current reconstructions and scores completed; paired mean F-score and IoU
 confidence intervals met the predeclared margin of +/-0.5 percentage points.
-These aggregate quality checks do not replace per-case numerical agreement.
+The checker computes F-score, voxel IoU and Chamfer distance. It does not
+compute Meta’s EMD metric or establish parity with the hosted held-out benchmark.
+See [benchmark coverage](VALIDATION.md#benchmark-coverage) before interpreting
+these results as a benchmark comparison.
 
 ## References
 

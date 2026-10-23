@@ -5,6 +5,14 @@ Tested 2026-10-21–22 on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700
 `f91db411c50efee93d8db7aeb323885650f6f722`; model weights are
 `facebook/sam-3d-objects` revision `2e73555018d2741ccd486e56c24fac41155a1dc6`.
 
+The checks answer different questions: reconstruction/export success, shape
+quality against Meta’s artist meshes, numerical agreement between implementations,
+and inference latency. Numerical agreement counts below are regression diagnostics;
+they are not percentages of cases that pass Meta’s benchmark. The historical
+49/100 iGPU comparison contains 100 completed reconstructions, with 49 meeting
+all four local output-agreement limits. See [benchmark coverage](#benchmark-coverage)
+for what the artist-reference evaluation establishes.
+
 ## Reproduce the checks
 
 `ryzers run` performs a headless installation smoke test without weights or
@@ -215,7 +223,8 @@ the two port-to-corrected benchmark pairs meets all four gates; the other
 fails coordinates and pose. The two corrected processes agree with each
 other under the same gates. The 100-case result above therefore establishes
 agreement for that cohort, not repeatability across every fresh default-mode
-process. This failed benchmark comparison remains unresolved.
+process. This variation remains relevant to repeatability; it is not a failure
+against Meta’s artist-reference benchmark.
 
 Explicit FAST/native controls on the same R9700 example pass 12 cold-to-warm
 and 16 cross-process comparisons across four fresh processes, including
@@ -248,9 +257,11 @@ cost **0.82 s, or 1.6%**. This is a measured cost, not a zero-penalty claim.
 Allocator statistics exclude checkpoint loading; allocations use shared RAM
 on this iGPU and are not an additional physical-memory pool.
 
-The corresponding R9700 matrix measures 24.73 to 13.13 s, but only one of its
-two captured numerical pairs meets all four gates, as described above. These
-timings are diagnostic results, not an accepted correctness-qualified speedup.
+The corresponding R9700 matrix measures **24.73 to 13.13 s (46.9% less
+latency)**. Its fresh-process numerical variation is documented above. All
+planned inference calls completed; output agreement and artist-reference
+quality are separate checks. Neither device’s timing results establish
+parity with Meta’s complete four-metric benchmark.
 
 ### Recorded comparison before the stability changes
 
@@ -453,8 +464,9 @@ Changes and intervals below are percentage points:
 | 8060S, historical raw port to corrected, F-score | -0.0691 | [-0.3266, +0.1539] |
 | 8060S, historical raw port to corrected, IoU | -0.0270 | [-0.2510, +0.1835] |
 
-These aggregate artist-mesh quality results do not substitute for per-case
-numerical agreement, including the historical-output failures above.
+These aggregate results measure preservation of mean shape quality. They do not
+promise unchanged quality on each object. The numerical comparisons above are
+separate implementation diagnostics, not Meta benchmark acceptance criteria.
 
 These are local metrics with explicit conventions, rather than official
 leaderboard scores. The public 100-object split differs from the paper's
@@ -462,3 +474,68 @@ aggregate evaluation; published aggregate scores are not a direct reference
 for this subset. Artist meshes are untextured: these checks measure shape
 after alignment, not texture quality or camera-pose accuracy. Complete model
 agreement with an NVIDIA CUDA run is a separate, unmeasured property.
+
+
+### Benchmark coverage
+
+Meta releases [100 reference image/mesh pairs and another 900 held-out benchmark
+inputs](https://ai.meta.com/datasets/sa-3dao-sam-3d-artist-objects-downloads/).
+The public 100 references are fully covered here. Meta’s [paper, Table 2 and
+Appendix D.3.1](https://arxiv.org/html/2511.16624v2#A4.SS3.SSS1), reports four
+shape metrics on its evaluation set:
+
+| Metric | Local coverage | Comparison limit |
+|---|---|---|
+| F-score @0.01 | 1M samples per mesh after normalization/ICP | Same definition; different evaluation set and local registration implementation |
+| Voxel IoU | 64³ surface occupancy | Voxel origin/bounds and alignment conventions are explicit local choices |
+| Chamfer distance | Mean/sum unsquared and sum squared directional distances | Paper does not specify all reduction conventions |
+| Earth Mover’s Distance | Not computed | No substitute approximation is presented as an official score |
+
+The published SAM 3D aggregates are F-score **0.2344**, voxel IoU **0.2311**,
+Chamfer **0.0400** and EMD **0.1211**. They are not direct targets for our
+100-object subset: matching numbers on different inputs would not establish
+benchmark parity. No official evaluator or compatible per-case baseline was
+found in the released model repository or the leaderboard’s static frontend.
+The hosted [official leaderboard](https://huggingface.co/spaces/facebook/sa3dao-leaderboard)
+evaluation API returned HTTP 503 during the 2026-10-22 check. Official benchmark
+parity remains unmeasured; it requires the hosted evaluation service or a
+released offline evaluator and a compatible reference.
+
+As a sensitivity check, the quality confidence intervals were also recomputed
+with 10,000 paired bootstrap resamples grouped by the **81 distinct decoded RGB
+images**, retaining all objects from each sampled image. This accounts for
+objects sharing an input image. Both F-score and IoU intervals remain inside
+the same +/-0.5 percentage-point equivalence margin. Current-default minus
+original-port intervals below are percentage points:
+
+| Device | F-score interval | Voxel-IoU interval |
+|---|---:|---:|
+| R9700 | [-0.0786, +0.1809] | [-0.0728, +0.1613] |
+| 8060S | [-0.3349, +0.1580] | [-0.2531, +0.1819] |
+
+This supports preservation of average quality on these references, not a claim
+that all objects are accurate or that all four official benchmark metrics pass.
+
+
+### Fresh-process cold-start coverage
+
+With the proposed defaults, **24/24 cold starts passed on each GPU**: two fresh
+processes per input across 12 preselected inputs. These include the original
+high-resolution kidsroom mask-14 reproduction, 11 SA-3DAO objects, portrait and
+landscape images, and the counter, telephone booth, perfume, eagle statue and
+printer depth-outlier cases. Every planned attempt is retained; none was
+retried or omitted. The first request after model construction must complete,
+export a nonempty finite nondegenerate mesh, produce finite pose and Gaussian
+attributes (position, features, scale, rotation and opacity), and contain finite
+depth points. Invalid depth outside the valid scene region is not classified
+as an inference failure. No depth hooks, recorded depth or ground-truth model
+inputs are used. Model/kernel caches persist as in normal use. Both GPUs run
+concurrently for this reliability check; its elapsed times are not performance
+benchmarks.
+
+In the earlier targeted allocator reproduction on one input under load, all
+**4/4** fresh processes with expandable segments produced nonfinite first-pass
+depth, versus **0/4** with native allocation. The newer 48-process sweep reports
+zero reconstruction/finite-output failures under the corrected settings. These
+are counts for the tested conditions, not a population failure-rate estimate,
+a proof that no bugs remain, or a four-metric benchmark score.
