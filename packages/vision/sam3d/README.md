@@ -117,10 +117,24 @@ metrics; it is separate from the default smoke test. See
 layout, commands, scoring conventions and coverage. The 400 historical and
 300 current reconstructions and scores completed; paired mean F-score and IoU
 confidence intervals met the predeclared margin of +/-0.5 percentage points.
-The checker computes F-score, voxel IoU and Chamfer distance. It does not
-compute Meta’s EMD metric or establish parity with the hosted held-out benchmark.
-See [benchmark coverage](VALIDATION.md#benchmark-coverage) before interpreting
-these results as a benchmark comparison.
+The checker computes F-score, voxel IoU and Chamfer distance. Add `--emd` for
+Wasserstein-2 / Earth Mover's Distance. The default EMD solver is an exact
+float64 CPU network-simplex solve on weighted voxel centroids. Optional
+`--emd-solver sinkhorn --emd-device cuda` enables GPU Sinkhorn evaluation on
+the same weighted point clouds. The optional EMD dependencies are included in
+the image; scoring existing meshes requires no weights or token.
+
+```sh
+ryzers run "python /ryzers/check_sam3d_dataset.py --self-test --emd"
+ryzers run "python /ryzers/check_sam3d_dataset.py --dataset-root /ryzers/output/sa3dao --predictions /ryzers/output/sa3dao-predictions --output /ryzers/output/sa3dao-four-metrics.json --emd --emd-solver exact --emd-grid-map /ryzers/sam3d_emd_grids.json"
+```
+
+EMD preserves all sampled surface mass through weighted voxel centroids and
+records spatial-compression and numerical bounds. Its dense transport solves
+use quadratic memory in the centroid count; `--emd-pitch` and
+`--emd-max-centroids` control that cost. Use the same grid settings across
+compared versions. These local metrics are not official held-out leaderboard
+scores; see [benchmark coverage](VALIDATION.md#benchmark-coverage).
 
 ## References
 

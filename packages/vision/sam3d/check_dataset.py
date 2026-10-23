@@ -1,6 +1,6 @@
 # Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""CPU mesh-quality metrics against independent SA-3DAO artist references.
+"""Mesh-quality metrics against independent SA-3DAO artist references.
 
 Definitions follow paper v2 D.3.1. Reports record normalization, alignment,
 sampling and distance conventions for reproducible comparisons.
@@ -308,9 +308,50 @@ def main():
         action="store_true",
         help="Run production inference into an empty prediction directory before scoring",
     )
+    parser.add_argument(
+        "--emd",
+        action="store_true",
+        help="also evaluate local EMD/Wasserstein-2 with recorded approximation bounds",
+    )
+    parser.add_argument(
+        "--emd-device",
+        default="cpu",
+        help="PyTorch evaluation device, e.g. cpu or cuda:0",
+    )
+    parser.add_argument(
+        "--emd-pitch",
+        type=float,
+        default=0.04,
+        help="weighted centroid grid pitch in normalized coordinates",
+    )
+    parser.add_argument("--emd-max-centroids", type=int, default=24576)
+    parser.add_argument("--emd-iterations", type=int, default=2000)
+    parser.add_argument("--emd-blur", type=float, default=0.01)
+    parser.add_argument(
+        "--emd-grid-map",
+        type=Path,
+        help="optional object-id to grid-pitch JSON; use a common map across compared versions",
+    )
+    parser.add_argument(
+        "--emd-solver",
+        choices=["sinkhorn", "exact"],
+        default="exact",
+        help="Sinkhorn approximation or exact CPU transport on weighted centroids",
+    )
+    parser.add_argument(
+        "--emd-lp-iterations",
+        type=int,
+        default=10000000,
+        help="pivot budget for the exact CPU transport solver",
+    )
     args = parser.parse_args()
     if args.self_test:
-        print(json.dumps(self_check(), indent=2))
+        result = self_check()
+        if args.emd:
+            from dataset_emd import self_check as check_emd
+
+            result["emd"] = check_emd()
+        print(json.dumps(result, indent=2))
         return
     if args.dataset_root is None or args.predictions is None:
         parser.error(
@@ -323,9 +364,48 @@ def main():
     )
     if not references:
         parser.error("No SA-3DAO object folders with reference mesh.glb files found")
+    grid_map = json.loads(args.emd_grid_map.read_text()) if args.emd_grid_map else {}
+    if args.emd and (
+        args.emd_pitch <= 0
+        or args.emd_blur <= 0
+        or args.emd_max_centroids < 2
+        or args.emd_iterations < 1
+        or args.emd_lp_iterations < 1
+    ):
+        parser.error("EMD pitch, blur, centroid limit and iterations must be positive")
     protocol = dict(
         PROTOCOL, surface_samples=args.samples, nearest_neighbor_workers=args.nn_workers
     )
+    if args.emd:
+        protocol["emd"] = {
+            "definition": "Balanced W2 approximation: sqrt of mean squared transport distance; lower is better",
+            "solver": (
+                "GeomLoss 0.3.1 warm start, POT 0.9.7.post1 float64 Sinkhorn"
+                if args.emd_solver == "sinkhorn"
+                else "POT 0.9.7.post1 exact CPU network simplex"
+            ),
+            "cost": (
+                "0.5 * squared Euclidean, epsilon=blur^2; report sqrt(2*transport_cost)"
+                if args.emd_solver == "sinkhorn"
+                else "Squared Euclidean; report sqrt(optimal transport cost)"
+            ),
+            "coupling": (
+                "Finite-iteration plan corrected to prescribed masses; feasible LP dual records optimization gap"
+                if args.emd_solver == "sinkhorn"
+                else "Optimality result code and primal/dual agreement verified"
+            ),
+            "compression": "All surface samples retained through weighted voxel centroids; RMS displacement recorded",
+            "grid_pitch": args.emd_pitch,
+            "grid_map": grid_map,
+            "max_centroids": args.emd_max_centroids,
+            "blur": args.emd_blur if args.emd_solver == "sinkhorn" else None,
+            "iterations": args.emd_iterations
+            if args.emd_solver == "sinkhorn"
+            else args.emd_lp_iterations,
+            "selected_solver": args.emd_solver,
+            "device": args.emd_device if args.emd_solver == "sinkhorn" else "cpu",
+            "scope": "Local approximation, not reproduction of unpublished Meta evaluator settings",
+        }
     report = {"protocol": protocol, "reference_count": len(references), "objects": []}
     if args.reconstruct:
         report["inference"] = reconstruct(references, args.predictions)
@@ -344,14 +424,36 @@ def main():
             a = sample(predicted, args.samples, seed)
             b = sample(reference, args.samples, seed ^ 0x91F08B3C)
             rotation, translation = align(a, b)
+            aligned = a @ rotation.T + translation
             row.update(
                 status="ok",
-                **metrics(a @ rotation.T + translation, b, workers=args.nn_workers),
+                **metrics(aligned, b, workers=args.nn_workers),
                 pred_normalization=pnorm,
                 reference_normalization=rnorm,
                 alignment_rotation=rotation.tolist(),
                 alignment_translation=translation.tolist(),
             )
+            if args.emd:
+                from dataset_emd import earth_mover
+
+                emd = earth_mover(
+                    aligned,
+                    b,
+                    pitch=float(grid_map.get(folder.name, args.emd_pitch)),
+                    max_centroids=args.emd_max_centroids,
+                    blur=args.emd_blur,
+                    device=args.emd_device,
+                    max_iterations=args.emd_iterations,
+                    solver=args.emd_solver,
+                    lp_iterations=args.emd_lp_iterations,
+                )
+                row.update(
+                    emd=emd,
+                    emd_w2=emd["w2"],
+                    emd_w2_lower=emd["w2_lower"],
+                    emd_full_sample_w2_lower=emd["full_sample_w2_lower"],
+                    emd_full_sample_w2_upper=emd["full_sample_w2_upper"],
+                )
         except Exception as error:
             row.update(
                 status="error", error_type=type(error).__name__, error=str(error)
@@ -371,6 +473,16 @@ def main():
                     "chamfer_l1_sum",
                     "chamfer_squared_sum",
                 ]
+                + (
+                    [
+                        "emd_w2",
+                        "emd_w2_lower",
+                        "emd_full_sample_w2_lower",
+                        "emd_full_sample_w2_upper",
+                    ]
+                    if args.emd
+                    else []
+                )
             }
             if good
             else {}

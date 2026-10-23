@@ -1,6 +1,6 @@
 # Numerical and performance validation
 
-Tested 2026-10-21–22 on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700
+Tested 2026-10-21–23 on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700
 (`gfx1201`), ROCm 7.14 / PyTorch 2.12. SAM 3D source is pinned to
 `f91db411c50efee93d8db7aeb323885650f6f722`; model weights are
 `facebook/sam-3d-objects` revision `2e73555018d2741ccd486e56c24fac41155a1dc6`.
@@ -489,7 +489,7 @@ shape metrics on its evaluation set:
 | F-score @0.01 | 1M samples per mesh after normalization/ICP | Same definition; different evaluation set and local registration implementation |
 | Voxel IoU | 64³ surface occupancy | Voxel origin/bounds and alignment conventions are explicit local choices |
 | Chamfer distance | Mean/sum unsquared and sum squared directional distances | Paper does not specify all reduction conventions |
-| Earth Mover’s Distance | Not computed | No substitute approximation is presented as an official score |
+| Earth Mover’s Distance / W2 | Exact weighted-centroid transport using all 1M sample weights | Spatial compression remains approximate; Meta’s Sinkhorn settings are unpublished |
 
 The published SAM 3D aggregates are F-score **0.2344**, voxel IoU **0.2311**,
 Chamfer **0.0400** and EMD **0.1211**. They are not direct targets for our
@@ -515,6 +515,89 @@ original-port intervals below are percentage points:
 
 This supports preservation of average quality on these references, not a claim
 that all objects are accurate or that all four official benchmark metrics pass.
+
+
+### Four-metric local evaluation
+
+All four 100-object cohorts now have all four local shape metrics. The EMD
+column uses **Wasserstein-2**, consistent with the official frontend’s metric
+label: the square root of minimum squared Euclidean transport cost. Lower is
+better for Chamfer and EMD; higher is better for F-score and IoU.
+
+| Device / version | F-score @0.01 | Voxel IoU | Mean unsquared Chamfer | Weighted EMD / W2 |
+|---|---:|---:|---:|---:|
+| R9700, compatibility port | 0.21437 | 0.22265 | 0.060131 | 0.218852 |
+| R9700, corrected defaults | 0.21465 | 0.22300 | 0.060088 | 0.218561 |
+| 8060S, historical compatibility port | 0.21671 | 0.22573 | 0.060391 | 0.221372 |
+| 8060S, corrected defaults | 0.21602 | 0.22546 | 0.060281 | 0.219528 |
+
+EMD reuses the existing normalization, rigid registration and one million
+surface samples per mesh. Every sample contributes its mass: occupied grid
+cells are represented by their weighted centroids, rather than discarding
+points through random subsampling. A common per-object pitch was selected
+across all four cohorts before EMD scoring, using the finest of 0.02, 0.03,
+0.04 and 0.06 that kept every mesh below 16,384 centroids. The included
+`emd_grid_map.json` records those pitches. The default cap of 24,576 leaves
+headroom for rerun variation; exceeding it fails explicitly.
+
+POT 0.9.7.post1 solves the weighted transport problem in float64 with network
+simplex. All **400 primary solves and 48 finer-grid solves** reached certified
+optima. The maximum absolute primal/dual squared-cost discrepancy was
+**3.45e-10**. Thirty-three initial solves exceeded a one-million-iteration
+budget; those attempts were retained and all completed with ten million
+iterations. The public checker uses that larger budget. Integer empirical
+masses and a fixed support permutation improve solver conditioning without
+changing the transport objective; a difficult full-size case matched the
+original optimum within 3e-16.
+
+Independent GPU Sinkhorn checks comprise 400 primary scores, 48 finer-grid
+scores and 48 smaller-regularization scores. All **496** primal/dual intervals
+contained their corresponding exact weighted optimum within 1e-7. However,
+71 exceeded the chosen numerical-gap target; smaller regularization alone did
+not reliably improve finite-iteration accuracy. Therefore the table uses the
+certified CPU optima, and the default `--emd` solver is exact. Sinkhorn remains
+an explicit option, with mass-correction and numerical-bound diagnostics.
+These evaluator choices do not affect model inference or its latency.
+
+The finer-grid check covers 12 preselected objects on all four cohorts. Its
+maximum absolute EMD change was **0.000702**. Exactness here applies to the
+weighted centroid distributions, not the uncompressed million-point problem.
+The checker also reports conservative bounds on that full empirical W2:
+subtract the two RMS quantization displacements from the compressed lower
+bound, and add their squared values to the compressed upper-bound squared
+cost before taking its square root. Across the 100 cases, mean lower/upper
+bounds are 0.192201/0.219991 and 0.191916/0.219714 for R9700 port/final, and
+0.194712/0.222511 and 0.192879/0.220675 for 8060S port/final.
+
+| EMD, corrected minus port | Mean change | Relative mean change | 95% paired image-cluster bootstrap interval |
+|---|---:|---:|---:|
+| R9700 | -0.000291 | -0.13% | [-0.001269, +0.000496] |
+| 8060S | -0.001844 | -0.83% | [-0.007133, +0.002128] |
+
+Intervals use 10,000 paired resamples, seed 42, grouped by the 81 distinct RGB
+images. Both contain zero: the slightly lower means do not establish a
+statistically significant quality improvement. The predeclared +/-0.005 mean
+equivalence margin applies to F-score and IoU only. No Chamfer or EMD acceptance
+margin was predeclared, so neither is assigned a retrospective pass threshold.
+All four metrics are available locally; official benchmark parity remains
+unmeasured because the evaluation set and unpublished evaluator conventions
+differ. This does not certify every reconstruction as accurate.
+
+Reproduce the controls and score existing meshes without weights or a token:
+
+```sh
+ryzers run "python /ryzers/check_sam3d_dataset.py --self-test --emd"
+ryzers run "python /ryzers/check_sam3d_dataset.py --dataset-root /ryzers/output/sa3dao --predictions /ryzers/output/sa3dao-predictions --output /ryzers/output/sa3dao-four-metrics.json --emd --emd-grid-map /ryzers/sam3d_emd_grids.json"
+```
+
+The controls include analytic identity/translation and unequal-mass cases,
+independent tiny assignment enumeration, 12 Sinkhorn comparisons with exact
+transport, mass/moment preservation and full-sample compression bounds.
+Final image smoke tests passed on both GPUs. Adding EMD left the original
+F-score, IoU and Chamfer fields unchanged in a full-million-sample CLI check;
+a missing prediction returned a nonzero exit status. Dense transport requires
+quadratic memory in centroid count; run fewer concurrent evaluations on UMA
+systems to bound total RAM use.
 
 
 ### Fresh-process cold-start coverage
