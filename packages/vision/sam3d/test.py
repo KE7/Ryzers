@@ -36,14 +36,80 @@ def check_sparse_convolution(kernel_size=3):
     print('Sparse convolution matches dense PyTorch reference')
 
 
+def check_repeatability(inference, image, mask):
+    """Check a cold reconstruction against three warm reconstructions."""
+    import numpy as np
+    import torch
+    from scipy.spatial import cKDTree
+
+    pipeline = inference._pipeline
+    originals = {}
+    captures = {}
+    for name, key in [('sample_sparse_structure', 'coords'), ('sample_slat', 'slat')]:
+        originals[name] = getattr(pipeline, name)
+
+        def capture(*args, _fn=originals[name], _key=key, **kwargs):
+            output = _fn(*args, **kwargs)
+            if _key == 'coords':
+                captures['coords'] = output['coords'].detach()
+            else:
+                captures['slat'] = output.feats.detach()
+                captures['slat_coords'] = output.coords.detach()
+            return output
+
+        setattr(pipeline, name, capture)
+    reference = None
+    try:
+        for index in range(4):
+            captures.clear()
+            output = inference(image, mask, seed=42)
+            torch.cuda.synchronize()
+            current = {key: value.cpu() for key, value in captures.items()}
+            current.update({key: output[key].detach().cpu()
+                            for key in ('rotation', 'translation', 'scale')})
+            vertices = np.asarray(output['glb'].vertices).copy()
+            assert len(vertices) and np.isfinite(vertices).all(), 'Invalid mesh'
+            assert all(torch.isfinite(value).all() for value in current.values()), 'Nonfinite output'
+            if reference is None:
+                reference, reference_vertices = current, vertices
+                diagonal = np.linalg.norm(np.ptp(reference_vertices, axis=0))
+                assert diagonal > 0, 'Degenerate reference mesh'
+            else:
+                for key in ('coords', 'slat_coords', 'rotation', 'translation', 'scale'):
+                    assert torch.equal(current[key], reference[key]), f'Repeat {index}: {key} changed'
+                expected = reference['slat'].double()
+                error = current['slat'].double() - expected
+                nrmse = (error.square().mean() / expected.square().mean()).sqrt().item()
+                assert nrmse <= 0.01, f'Repeat {index}: SLAT normalized RMS {nrmse}'
+                rng = np.random.default_rng(42)
+                distances = []
+                for source, target in ((reference_vertices, vertices), (vertices, reference_vertices)):
+                    sample = source[rng.choice(len(source), min(10000, len(source)), replace=False)]
+                    distances.extend(cKDTree(target).query(sample, workers=2)[0] / diagonal)
+                p99 = float(np.quantile(distances, 0.99))
+                assert p99 <= 0.005, f'Repeat {index}: mesh p99 / bbox diagonal {p99}'
+                print('PASS: repeatability', json.dumps({
+                    'repeat': index, 'exact_coordinates_and_pose': True,
+                    'slat_nrmse': nrmse, 'mesh_p99_bbox_fraction': p99,
+                }))
+            del output, current
+    finally:
+        for name, original in originals.items():
+            setattr(pipeline, name, original)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--smoke', action='store_true', help='check GPU and imports without downloading weights')
     parser.add_argument('--output', type=Path, default=Path('/ryzers/output'))
+    parser.add_argument('--check-repeatability', action='store_true',
+                        help='check one cold and three warm reconstructions using the numerical regression limits')
     masks = parser.add_mutually_exclusive_group()
     masks.add_argument('--mask-index', type=int, nargs='+', default=[14])
     masks.add_argument('--all-masks', action='store_true', help='run the upstream multi-object notebook masks')
     args = parser.parse_args()
+    if args.check_repeatability and (args.smoke or args.all_masks or len(args.mask_index) != 1):
+        parser.error('--check-repeatability requires one mask and cannot be combined with --smoke or --all-masks')
     import torch
     if not torch.version.hip or not torch.cuda.is_available():
         raise RuntimeError('SAM 3D requires an accessible ROCm GPU')
@@ -56,7 +122,9 @@ def main():
         print('SAM 3D inference imports passed')
         return
     from huggingface_hub import snapshot_download
-    checkpoint_root = Path(snapshot_download('facebook/sam-3d-objects', allow_patterns=['checkpoints/*'])) / 'checkpoints'
+    checkpoint_root = Path(snapshot_download(
+        'facebook/sam-3d-objects', revision='2e73555018d2741ccd486e56c24fac41155a1dc6',
+        allow_patterns=['checkpoints/*'])) / 'checkpoints'
     example = root / 'notebook/images/shutterstock_stylish_kidsroom_1640806567'
     image = load_image(str(example / 'image.png'))
     indices = sorted(int(p.stem) for p in example.glob('[0-9]*.png')) if args.all_masks else args.mask_index
@@ -64,6 +132,10 @@ def main():
     start = time.monotonic()
     inference = Inference(str(checkpoint_root / 'pipeline.yaml'), compile=False)
     load_seconds = round(time.monotonic() - start, 1)
+    if args.check_repeatability:
+        mask = load_single_mask(str(example), index=indices[0])
+        check_repeatability(inference, image, mask)
+        return
     outputs = []
     for index in indices:
         torch.cuda.reset_peak_memory_stats()

@@ -1,6 +1,6 @@
 # Numerical and performance validation
 
-Validated 2026-10-21 on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700
+Tested 2026-10-21–22 on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700
 (`gfx1201`), ROCm 7.14 / PyTorch 2.12. SAM 3D source is pinned to
 `f91db411c50efee93d8db7aeb323885650f6f722`; model weights are
 `facebook/sam-3d-objects` revision `2e73555018d2741ccd486e56c24fac41155a1dc6`.
@@ -14,6 +14,7 @@ in the README only when they reconstruct images:
 ```sh
 ryzers run "python /ryzers/check_sam3d_numerics.py"
 ryzers run "python /ryzers/test_sam3d_conditioning_cache.py"
+ryzers run "python /ryzers/test_sam3d.py --check-repeatability"
 ryzers run "python /ryzers/test_sam3d.py --mask-index 14 3"
 ryzers run "python /ryzers/test_sam3d.py --all-masks"
 ```
@@ -143,24 +144,125 @@ RGB-only runs. Input RGB tensors match exactly while estimated depth and
 intrinsics differ. An unchanged original-port counter rerun also differs
 from its earlier result: mesh p99 0.53416%, above the same 0.5% limit.
 These controls check the SAM 3D stages under identical depth conditioning.
-The underlying source of MoGe/ROCm variation is not established. They do not
-replace the raw comparisons or relax their limits.
+They do not replace the raw comparisons or relax their limits.
+
+Subsequent cold/warm controls identified two runtime stability problems on
+8060S. Timing-based MIOpen solver selection changes FP16 depth estimates across
+fresh processes. Expandable allocator segments can also produce nonfinite
+depth tensors: four fresh processes using the native allocator passed all
+three reconstructions, while all four expandable-segment processes produced
+nonfinite depth on their first reconstruction. The image therefore uses the
+native allocator and defaults to MIOpen `FAST` on `gfx1151`. Fresh paired
+comparisons must use the same stability settings for the compatibility-only
+port and optimized implementation. Such comparisons are distinct from the
+historical raw results above.
 
 Both devices also exported PLY/GLB for all 27 example masks and assembled a
 scene of about 13.6 million Gaussians. Checks verify finite geometry and PLY
 attributes, read back GLB meshes, and require the assembled count to equal
 the sum of individual objects. Cross-device output counts need not be equal.
 
+### Current default comparison
+
+With the native allocator, the corrected optimized image passes the same four
+limits on all 100 objects on each GPU. R9700 is compared with its original
+saved compatibility-port outputs. On 8060S, both the unoptimized compatibility
+port and optimized image were rerun with the native allocator and MIOpen
+`FAST`. This fresh common-runtime comparison does not replace the historical
+49/100 result above or claim to reproduce its unstable depth estimates.
+
+| Compatibility-only port to corrected defaults, 100 objects | R9700 | 8060S |
+|---|---:|---:|
+| Pairs meeting all four strict limits | **100/100** | **100/100** |
+| Exact SS and SLAT sparse coordinates | 100/100 | 100/100 |
+| Exact rotation, translation and scale tensors | 100/100 | 100/100 |
+| Maximum SLAT normalized RMS difference | 0.10055% | 0.10848% |
+| Maximum SLAT absolute difference | 0.12493 | 0.07251 |
+| Maximum mesh symmetric NN p99 / bbox diagonal | 0.02426% | 0.02571% |
+
+Each run reconstructs from RGB and mask, independently estimating depth with
+the unmodified public MoGe path. No recorded or reference depth is supplied.
+All 100 8060S pairs also have bitwise-identical public pointmap and pointmap-color
+return tensors, captured after inference completes. The numerical gates remain
+exact coordinates and pose, SLAT normalized RMS at most 1%, and mesh p99 at most
+0.5% of the reference bounding-box diagonal.
+
+The public `--check-repeatability` check also passes on both GPUs: one cold
+reconstruction and three warm reconstructions per device, with all three
+cold-to-warm comparisons meeting those same four limits.
+
+Both corrected images also export all 27 masks and assemble the scene. The
+8060S scene contains 13,593,632 Gaussians; its peak allocated memory across
+inference and assembly is 14.80 GiB, excluding checkpoint loading. Process
+peak RSS, including loading, is 11.54 GiB; temporary export files reside in
+shared-memory storage outside process RSS. These measures are not additive
+on unified-memory hardware. R9700 produces 13,611,264 Gaussians; its measured
+maximum per-mask allocation is 14.80 GiB, with final assembly allocation not
+captured by that run.
+
+Compared instead with the original saved 8060S `DEFAULT`-mode outputs, the
+corrected image meets all four limits on **0/100** cases: coordinates match
+on 11/100, pose on 0/100, and mesh p99 is within its limit on 84/100. Maximum
+mesh p99 is 6.69693%. Changing the solver policy therefore does not preserve
+those historical outputs. The common-runtime 100/100 result establishes
+optimization agreement under the stable policy, not exact restoration of the
+original outputs.
+
+Fresh-process R9700 mask-14 benchmarks also expose variation in the unchanged
+compatibility port under its default solver policy: two processes produce
+26,346 versus 26,344 sparse coordinates and different pose tensors. One of
+the two port-to-corrected benchmark pairs meets all four gates; the other
+fails coordinates and pose. The two corrected processes agree with each
+other under the same gates. The 100-case result above therefore establishes
+agreement for that cohort, not repeatability across every fresh default-mode
+process. This failed benchmark comparison remains unresolved.
+
+Explicit FAST/native controls on the same R9700 example pass 12 cold-to-warm
+and 16 cross-process comparisons across four fresh processes, including
+compatibility-port versus optimized comparisons. All cross-process pointmaps
+and colors match bitwise. This covers one mask, not the 100-object dataset;
+it does not establish full-cohort FAST agreement or change the R9700 default.
+
 ## Performance and memory
 
-The comparison uses the original compatibility-only port from
+### Current 8060S defaults
+
+An isolated A/B/C/C/B/A matrix compares the original compatibility-only port,
+merged defaults and corrected defaults. Each version has two fresh processes,
+each with one cold warmup and three timed requests: six timed samples per
+version. The port and corrected image use the same native allocator and FAST
+solver policy. Both captured port-to-corrected pairs meet all four numerical
+gates: exact coordinates and pose, maximum SLAT normalized RMS 0.02649%, and
+maximum mesh p99 0.005635% of the reference bounding-box diagonal.
+
+| Warm mask-14 inference, 8060S | Port only | Corrected defaults |
+|---|---:|---:|
+| Median of six | 134.48 s | **51.89 s** |
+| Range | 133.77–134.61 s | 51.42–52.59 s |
+| Peak allocated memory | 18.88 GiB | 13.75 GiB |
+| Peak reserved memory | 22.41 GiB | 19.51 GiB |
+
+The total saving is **82.59 s per object, 61.4% less latency, or 2.59× faster**.
+Against the former merged defaults (51.07 s median), the stability changes
+cost **0.82 s, or 1.6%**. This is a measured cost, not a zero-penalty claim.
+Allocator statistics exclude checkpoint loading; allocations use shared RAM
+on this iGPU and are not an additional physical-memory pool.
+
+The corresponding R9700 matrix measures 24.73 to 13.13 s, but only one of its
+two captured numerical pairs meets all four gates, as described above. These
+timings are diagnostic results, not an accepted correctness-qualified speedup.
+
+### Recorded comparison before the stability changes
+
+The recorded comparison uses the original compatibility-only port from
 `54bde2c` against final defaults from `d3a563b`, including all subsequent
 optimizations. The original image's patch SHA-256 matches the first commit;
 only the sparse-convolution import substitutions and Kaolin compatibility
 changes are present. Both images share their first 27 filesystem layers,
 including the pinned upstream checkout and dependencies, and use the pinned
-model revision above. The original allocator default and final expandable
-allocator default are included in their respective measurements.
+model revision above. These measurements include the merged optimized image's
+expandable allocator setting; the current image uses the native allocator
+for the stability reasons above.
 
 Both images use the same harness: one loaded model, one warmup followed by
 three timed mask-14 runs, seed 42, default steps, both geometry decoders and
@@ -183,8 +285,8 @@ the next inference. The baseline runs its original source and defaults directly.
 | Final peak allocated GPU memory | 13.70 GiB | 13.70 GiB |
 | Port-only peak reserved GPU memory | 22.41 GiB | 22.41 GiB |
 | Final peak reserved GPU memory | 14.89 GiB | 14.89 GiB |
-| Full 27-object run, peak allocated GPU memory | 14.74 GiB | 14.74 GiB |
-| Full 27-object run, peak reserved GPU memory | 15.80 GiB | 16.19 GiB |
+| Maximum per-mask inference allocation, 27-object run | 14.74 GiB | 14.74 GiB |
+| Maximum per-mask inference reservation, 27-object run | 15.80 GiB | 16.19 GiB |
 | Full-run CPU process peak RSS, including loading | 11.67 GiB | 11.64 GiB |
 
 The earlier same-process comparison measured the final group of changes only:
@@ -194,8 +296,9 @@ masters enabled the paired storage-format toggles for that experiment and
 were released before its final-default runs. Savings from separate attribution
 experiments are not added together.
 
-Full-scene runs retain individual Gaussian outputs until assembly. GPU
-allocation peaks above exclude checkpoint loading. On Strix Halo GPU allocations use shared physical
+Full-scene runs retain individual Gaussian outputs until assembly. The recorded
+per-mask GPU peaks exclude checkpoint loading and final scene assembly.
+On Strix Halo GPU allocations use shared physical
 RAM; do not add CPU RSS and GPU allocator statistics as an exact physical-memory
 total.
 
@@ -205,8 +308,6 @@ byte comparison follows checkpoint loading, so the initial load-time peak is
 not eliminated. Matching inputs produce four backbone computations and four
 cross-stage cache hits per object. Frozen SS linear storage removes another
 1,914,175,488 bytes (1.78 GiB) of FP32 weight storage. Normalization stays FP32.
-A same-process allocator comparison preserved exact occupancy/pose while
-reducing reserved memory from 21.34 GB to 15.06 GB on either device.
 
 PLY attribute packing was separately measured on 13,611,264 Gaussians:
 17.98 s to 0.062 ms, peak CPU process RSS 11.90 to 1.75 GiB, identical
@@ -239,8 +340,11 @@ paths for unsupported shapes, modes and devices.
 | Frozen DINO sharing / raw feature reuse | `SAM3D_SHARE_BACKBONES` / `SAM3D_CACHE_IMAGE_FEATURES` |
 | Exact elementwise fusion | `SAM3D_TRITON_POINTWISE` |
 
-`PYTORCH_ALLOC_CONF=expandable_segments:True` is the image default; override
-with `expandable_segments:False` for the allocator reference.
+`PYTORCH_ALLOC_CONF=expandable_segments:False` is the image default. Expandable
+segments are excluded from the validated configuration because of the cold
+depth failures above. On `gfx1151`, the pipeline sets `MIOPEN_FIND_MODE=FAST`
+unless it was explicitly set before construction. Other architectures do not
+set this variable. These are process-wide runtime settings.
 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` enables fused SDPA on 8060S.
 Optional rasterization, texture baking and layout optimization remain outside
 the validated reconstruction/export paths, as described in the README.
@@ -293,7 +397,7 @@ Chamfer reports distinguish the mean/sum of unsquared Euclidean directional
 distances and the sum of directional mean squared distances. Identity, known rigid motion and
 shape-deformation controls check the evaluator independently of model outputs.
 
-The compatibility-only port and optimized defaults each reconstructed all
+The historical compatibility-only port and optimized image each reconstructed all
 100 objects on both GPUs: 400 successful reconstructions and CPU scores,
 without inference/scoring errors. Means over the same 100 references are:
 
@@ -325,6 +429,32 @@ IoU changes are +0.0037 / -0.0296 points. This shared-frame diagnostic does not
 replace the primary independently registered scores or predeclared criterion.
 The concurrent dataset runs test quality; their elapsed times are not the
 isolated performance measurements above.
+
+The current-default evaluation adds 300 successful reconstructions and scores:
+the corrected R9700 image, and both the compatibility-only port and corrected
+image under the common 8060S stability settings. All use the same 100 artist
+references and unchanged scoring protocol.
+
+| Current evaluation | F-score @0.01 | Surface voxel IoU, 64 | Mean unsquared Chamfer |
+|---|---:|---:|---:|
+| R9700, corrected defaults | 0.21465 | 0.22300 | 0.060088 |
+| 8060S, compatibility port with stable runtime | 0.21568 | 0.22553 | 0.060282 |
+| 8060S, corrected defaults | 0.21602 | 0.22546 | 0.060281 |
+
+All current comparisons meet the same paired-mean equivalence criterion.
+Changes and intervals below are percentage points:
+
+| Comparison / metric | Mean change | 95% paired bootstrap interval |
+|---|---:|---:|
+| R9700, original port to corrected, F-score | +0.0276 | [-0.0815, +0.1799] |
+| R9700, original port to corrected, IoU | +0.0352 | [-0.0708, +0.1632] |
+| 8060S, common stable runtime, F-score | +0.0341 | [-0.0882, +0.1588] |
+| 8060S, common stable runtime, IoU | -0.0071 | [-0.1002, +0.0816] |
+| 8060S, historical raw port to corrected, F-score | -0.0691 | [-0.3266, +0.1539] |
+| 8060S, historical raw port to corrected, IoU | -0.0270 | [-0.2510, +0.1835] |
+
+These aggregate artist-mesh quality results do not substitute for per-case
+numerical agreement, including the historical-output failures above.
 
 These are local metrics with explicit conventions, rather than official
 leaderboard scores. The public 100-object split differs from the paper's

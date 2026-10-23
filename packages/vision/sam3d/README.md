@@ -35,12 +35,12 @@ in `workspace/.cache/huggingface` and `workspace/.cache/torch`. Exported PLY spl
 vertex-colored GLB meshes and validation JSON persist in `workspace/sam3d`.
 The token is forwarded at runtime; keep it out of `config.yaml` and build arguments.
 
-Select a GPU on machines with multiple devices (indices below are specific to
-the validation machine):
+Select a GPU on machines with multiple devices. List devices first; their
+indices can change after a reboot:
 
 ```sh
-HIP_VISIBLE_DEVICES=0 ryzers run "python /ryzers/test_sam3d.py"  # 8060S iGPU
-HIP_VISIBLE_DEVICES=1 ryzers run "python /ryzers/test_sam3d.py"  # R9700
+ryzers run "python -c 'import torch; print([(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())])'"
+HIP_VISIBLE_DEVICES=0 ryzers run "python /ryzers/test_sam3d.py"  # replace 0 with the chosen index
 ```
 
 Additional masks and multi-object scene assembly are explicit checks:
@@ -48,7 +48,13 @@ Additional masks and multi-object scene assembly are explicit checks:
 ```sh
 ryzers run "python /ryzers/test_sam3d.py --mask-index 14 3"
 ryzers run "python /ryzers/test_sam3d.py --all-masks"
+ryzers run "python /ryzers/test_sam3d.py --check-repeatability"
 ```
+
+The repeatability check compares one cold reconstruction with three warm runs,
+requiring exact sparse coordinates and pose, SLAT normalized RMS error at most
+1%, and sampled mesh p99 distance at most 0.5% of the reference bounding-box
+diagonal. It requires the model weights and runs one mask.
 
 ## ROCm support and validation
 
@@ -64,21 +70,33 @@ weight layout.
 Four DINO preprocessing wrappers share one byte-identical frozen backbone;
 matching backbone features are reused across stages. Frozen structure-sampler
 linear weights use the FP16 storage already used by autocast, while normalization
-parameters remain FP32. Expandable allocator segments and a shared NumPy buffer
-for PLY export reduce temporary allocations, including RAM shared with the iGPU.
+parameters remain FP32. A shared NumPy buffer for PLY export reduces temporary
+allocations, including RAM shared with the iGPU.
 These optimizations are enabled by default, with guards for supported shapes,
 precision and inference mode. See [VALIDATION.md](VALIDATION.md) for overrides.
 
-Validated on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700 (`gfx1201`),
-ROCm 7.14 / PyTorch 2.12. Compared with the first working port, warm mask-14
-medians fell **24.97 → 13.22 s on R9700 (47.1% less latency)** and
-**130.60 → 51.15 s on 8060S (60.8% less latency)**, using default
-steps and both geometry decoders. Peak allocated memory for that object fell
-from about 18.88 to 13.70 GiB on both GPUs. Both devices
-exported all 27 example objects and assembled the complete scene. Peak allocated
-GPU memory during the full scene runs was **14.74 GiB** on either device;
-checkpoint-loading peaks are excluded. See [VALIDATION.md](VALIDATION.md) for
-reference provenance, maximum errors, coverage and measurement methods.
+The image uses the native PyTorch allocator because expandable segments caused
+nonfinite depth tensors on 8060S. On `gfx1151`, convolution solver selection
+defaults to `MIOPEN_FIND_MODE=FAST` to avoid depth variation between fresh
+processes; an explicit runtime setting takes precedence. Other GPUs retain
+their existing convolution solver policy.
+
+Tested on Radeon 8060S (`gfx1151`) and Radeon AI PRO R9700 (`gfx1201`),
+ROCm 7.14 / PyTorch 2.12. Under the same native-allocator/FAST runtime,
+8060S warm mask-14 medians fell **134.48 → 51.89 s (61.4% less latency)**
+from the first working port to corrected defaults, using default steps and both
+geometry decoders. Peak allocated memory fell **18.88 → 13.75 GiB**.
+The stability settings cost 0.82 s (1.6%) versus the former merged defaults.
+Both captured benchmark pairs and all 100 dataset pairs meet the four numerical
+limits under that common runtime; historical DEFAULT-mode outputs differ.
+
+Both devices exported all 27 objects and assembled the complete scene. The
+8060S peak allocated memory including assembly is **14.80 GiB**, excluding
+checkpoint loading. The R9700 100-case cohort passes, but a separate fresh-process
+benchmark pair fails exact coordinates and pose; the unchanged port also varies
+between fresh default-mode processes. This remains unresolved. See
+[VALIDATION.md](VALIDATION.md) for all reference comparisons, maximum errors,
+historical results and measurement scopes.
 
 Optional mesh cleanup, texture baking, layout optimization and Gaussian video
 rendering need additional GPU rasterizers and are not supported here. The
@@ -92,10 +110,10 @@ provides artist-created reference meshes for independent shape evaluation.
 The optional dataset checker reconstructs those inputs and computes CPU mesh
 metrics; it is separate from the default smoke test. See
 [dataset validation](VALIDATION.md#sa-3dao-reference-evaluation) for the data
-layout, commands, scoring conventions and coverage. All 400 original-port /
-optimized reconstructions across the two GPUs completed; paired mean F-score
-and IoU confidence intervals met the predeclared margin of
-+/-0.5 percentage points.
+layout, commands, scoring conventions and coverage. The 400 historical and
+300 current reconstructions and scores completed; paired mean F-score and IoU
+confidence intervals met the predeclared margin of +/-0.5 percentage points.
+These aggregate quality checks do not replace per-case numerical agreement.
 
 ## References
 
